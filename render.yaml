@@ -1,0 +1,20 @@
+# Render Blueprint for the Halo API (New > Blueprint, pick this repo).
+services:
+  - type: web
+    name: halo-backend
+    runtime: node
+    plan: free
+    region: ohio            # same AWS region as the Neon database (us-east-2) – keeps queries fast
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: DATABASE_URL     # Neon connection string – entered in the Render dashboard, never committed
+        sync: false
+      - key: CLIENT_ORIGIN    # your Vercel URL, e.g. https://halo-frontend.vercel.app
+        sync: false
+      - key: DB_WARM_CONNECTIONS
+        value: "4"
