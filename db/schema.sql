@@ -1,4 +1,14 @@
--- Halo Admin schema (PostgreSQL / Neon). Safe to run more than once.
+-- Halo Admin database schema (PostgreSQL / Neon).
+-- Applied by `npm run migrate` (src/migrate.js). Safe to run more than once: tables and indexes are only
+-- created if they don't exist yet ("IF NOT EXISTS"), and the settings row is only inserted once.
+--
+-- Column types used below:
+--   uuid          random unique id (gen_random_uuid() creates one automatically)
+--   numeric(14,2) exact money amount with 2 decimals (never use floating point for money)
+--   timestamptz   date + time with time zone
+--   CHECK (...)   the database refuses values outside the listed ones
+
+-- users: one row per app user, with their two wallet balances, VIP level and KYC/account status.
 CREATE TABLE IF NOT EXISTS users (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   seq             integer,                       -- dummy index used by the team generator
@@ -14,8 +24,10 @@ CREATE TABLE IF NOT EXISTS users (
   status          text NOT NULL DEFAULT 'active' CHECK (status IN ('active','frozen')),
   joined_at       timestamptz NOT NULL DEFAULT now()
 );
+-- Indexes make lookups by these columns fast.
 CREATE INDEX IF NOT EXISTS users_phone_idx ON users (phone);
 
+-- transactions: deposits and withdrawals (column "type"). The admin approves pending withdrawals.
 CREATE TABLE IF NOT EXISTS transactions (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tx_id       text UNIQUE NOT NULL,
@@ -32,6 +44,7 @@ CREATE INDEX IF NOT EXISTS transactions_type_status_idx ON transactions (type, s
 -- Insertion order is used for list display, matching the prototype's table order.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS seq bigserial;
 
+-- kyc_requests: identity documents users submitted; the admin approves or rejects them (KYC review page).
 CREATE TABLE IF NOT EXISTS kyc_requests (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id         uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -43,6 +56,8 @@ CREATE TABLE IF NOT EXISTS kyc_requests (
 );
 CREATE INDEX IF NOT EXISTS kyc_status_idx ON kyc_requests (status);
 
+-- banners: the promotional banners in the user app – "popup" (shown after login) or "home" (home carousel).
+-- sort_order is the position on screen (0 = first).
 CREATE TABLE IF NOT EXISTS banners (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   kind        text NOT NULL CHECK (kind IN ('popup','home')),
@@ -52,6 +67,7 @@ CREATE TABLE IF NOT EXISTS banners (
   sort_order  integer NOT NULL DEFAULT 0
 );
 
+-- balance_adjustments: a record of every manual credit/debit an admin made to a user's wallet, with the reason.
 CREATE TABLE IF NOT EXISTS balance_adjustments (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -62,6 +78,7 @@ CREATE TABLE IF NOT EXISTS balance_adjustments (
 );
 CREATE INDEX IF NOT EXISTS adjustments_user_idx ON balance_adjustments (user_id, created_at DESC);
 
+-- orders: demo order records from the prototype; only the sum of "fee" is used (dashboard card).
 CREATE TABLE IF NOT EXISTS orders (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   order_id    text UNIQUE NOT NULL,
@@ -74,7 +91,8 @@ CREATE TABLE IF NOT EXISTS orders (
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- Single-row platform settings (key = 'global').
+-- settings: platform-wide settings in a single row (key = 'global'): minimums, maintenance mode,
+-- Telegram links and the announcement ticker text. The INSERT below creates that row the first time.
 CREATE TABLE IF NOT EXISTS settings (
   key                 text PRIMARY KEY,
   fee_percent         numeric(6,2) NOT NULL DEFAULT 30,
@@ -91,3 +109,49 @@ CREATE TABLE IF NOT EXISTS settings (
   announcement_live   boolean NOT NULL DEFAULT true
 );
 INSERT INTO settings (key) VALUES ('global') ON CONFLICT (key) DO NOTHING;
+
+-- =========================================================================
+-- User app accounts, wallets and payments (B-Infinity)
+-- =========================================================================
+
+-- Login details for user accounts. Passwords are stored only as scrypt hashes (see src/auth/passwords.js).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS country_iso text NOT NULL DEFAULT 'us';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS fund_password_hash text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS invite_code text;
+-- Raised on logout so that tokens issued before the logout stop working.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version integer NOT NULL DEFAULT 0;
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (lower(email)) WHERE email IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS users_phone_country_unique ON users (country_iso, phone);
+CREATE UNIQUE INDEX IF NOT EXISTS users_invite_code_unique ON users (invite_code) WHERE invite_code IS NOT NULL;
+
+-- Deposits and withdrawals: fee charged, when a deposit address expires.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS fee numeric(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+-- "Expired" is set when a deposit address runs out of time before anyone pays.
+ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_status_check;
+ALTER TABLE transactions ADD CONSTRAINT transactions_status_check
+  CHECK (status IN ('Pending','Paid','Credited','Rejected','Expired'));
+
+-- KYC: the user's details and the two ID photos (stored as data URLs for now).
+ALTER TABLE kyc_requests ADD COLUMN IF NOT EXISTS full_name text NOT NULL DEFAULT '';
+ALTER TABLE kyc_requests ADD COLUMN IF NOT EXISTS front_image text;
+ALTER TABLE kyc_requests ADD COLUMN IF NOT EXISTS back_image text;
+ALTER TABLE kyc_requests ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+
+-- Wallet ledger: every change to a user's Flexible or Active balance made by the user app
+-- (deposit credits, withdrawal holds and refunds, transfers). Amounts are signed: + in, - out.
+CREATE TABLE IF NOT EXISTS wallet_entries (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  wallet      text NOT NULL CHECK (wallet IN ('flexible','active')),
+  kind        text NOT NULL CHECK (kind IN ('recharge','withdrawal','withdrawal_refund',
+                                             'transfer_in','transfer_out',
+                                             'wallet_transfer_in','wallet_transfer_out')),
+  amount      numeric(14,2) NOT NULL,
+  reference   text NOT NULL DEFAULT '',
+  note        text NOT NULL DEFAULT '',
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS wallet_entries_user_idx ON wallet_entries (user_id, created_at DESC);

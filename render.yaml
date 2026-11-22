@@ -1,4 +1,5 @@
 # Render Blueprint for the Halo API (New > Blueprint, pick this repo).
+# Values marked "sync: false" are secrets or per-account addresses: enter them in the Render dashboard.
 services:
   - type: web
     name: halo-backend
@@ -12,9 +13,19 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "20"
-      - key: DATABASE_URL     # Neon connection string – entered in the Render dashboard, never committed
+      - key: DATABASE_URL          # Neon connection string
         sync: false
-      - key: CLIENT_ORIGIN    # your Vercel URL, e.g. https://halo-frontend.vercel.app
+      - key: AUTH_SECRET           # long random string that signs login tokens
+        sync: false
+      - key: ADMIN_EMAIL           # admin panel login email
+        sync: false
+      - key: ADMIN_PASSWORD        # admin panel login password (use a strong one)
+        sync: false
+      - key: OXAPAY_MERCHANT_API_KEY  # OxaPay merchant key; also verifies their webhooks
+        sync: false
+      - key: PUBLIC_API_URL        # this service's own address, e.g. https://halo-backend.onrender.com
+        sync: false
+      - key: CLIENT_ORIGIN         # the frontend address allowed to call this API (comma-separate several)
         sync: false
       - key: DB_WARM_CONNECTIONS
         value: "4"

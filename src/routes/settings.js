@@ -1,75 +1,134 @@
+// Routes for the admin Settings page: deposit/withdrawal minimums, maintenance mode and Telegram links.
+// Mounted at /api/settings in index.js. Every route here needs an admin token (see middleware/require-admin.js).
+// All settings are stored in ONE row of the "settings" table, the row with key = 'global'.
 import { Router } from 'express';
 import { query, num } from '../db.js';
 import { asyncHandler, HttpError } from '../utils/http.js';
 
 const router = Router();
-const TELEGRAM_KEYS = ['official', 'support', 'community'];
 
-const SELECT_SETTINGS = 'SELECT * FROM settings WHERE key = $1';
+const TELEGRAM_CHANNELS = ['official', 'support', 'community'];
+const MIN_MAINTENANCE_HOURS = 1;
+const MAX_MAINTENANCE_HOURS = 168; // one week
 
-const present = (s) => ({
-  feePercent: num(s.fee_percent),
-  trialAmount: num(s.trial_amount),
-  minDeposit: num(s.min_deposit),
-  minWithdrawal: num(s.min_withdrawal),
-  maintenance: { enabled: s.maint_enabled, hours: s.maint_hours, startedAt: s.maint_started_at },
-  telegram: { official: s.tg_official, support: s.tg_support, community: s.tg_community },
+// Database row → the JSON shape the admin app expects.
+const toSettingsResponse = (settings) => ({
+  feePercent: num(settings.fee_percent),
+  trialAmount: num(settings.trial_amount),
+  minDeposit: num(settings.min_deposit),
+  minWithdrawal: num(settings.min_withdrawal),
+  maintenance: {
+    enabled: settings.maint_enabled,
+    hours: settings.maint_hours,
+    startedAt: settings.maint_started_at,
+  },
+  telegram: {
+    official: settings.tg_official,
+    support: settings.tg_support,
+    community: settings.tg_community,
+  },
 });
 
-const load = async () => (await query(SELECT_SETTINGS, ['global'])).rows[0];
+// Reads the single settings row.
+async function loadGlobalSettings() {
+  const { rows } = await query('SELECT * FROM settings WHERE key = $1', ['global']);
+  return rows[0];
+}
 
-const nonNegative = (value, label) => {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) throw new HttpError(400, `${label} must be a positive number`);
-  return n;
-};
+// Returns the value as a number, or stops the request with 400 if it isn't a number of 0 or more.
+function requireNonNegativeNumber(value, label) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new HttpError(400, `${label} must be a positive number`);
+  }
+  return number;
+}
 
-router.get('/', asyncHandler(async (req, res) => res.json(present(await load()))));
+// GET /api/settings → all settings (see toSettingsResponse for the shape)
+router.get(
+  '/',
+  asyncHandler(async (req, res) => {
+    const settings = await loadGlobalSettings();
+    res.json(toSettingsResponse(settings));
+  })
+);
 
-// PUT /api/settings  { minDeposit, minWithdrawal, maintenanceHours }
+// PUT /api/settings  body { minDeposit?, minWithdrawal?, maintenanceHours? } → all settings after saving
+// Only the fields that are sent get changed.
 router.put(
   '/',
   asyncHandler(async (req, res) => {
     const { minDeposit, minWithdrawal, maintenanceHours } = req.body;
-    const sets = [];
+
+    // Build the "SET ..." part of the SQL from the fields that were sent (values go in `params` as $1, $2, ...).
+    const setClauses = [];
     const params = [];
-    if (minDeposit !== undefined) { params.push(nonNegative(minDeposit, 'Minimum deposit')); sets.push(`min_deposit = $${params.length}`); }
-    if (minWithdrawal !== undefined) { params.push(nonNegative(minWithdrawal, 'Minimum withdrawal')); sets.push(`min_withdrawal = $${params.length}`); }
+    if (minDeposit !== undefined) {
+      params.push(requireNonNegativeNumber(minDeposit, 'Minimum deposit'));
+      setClauses.push(`min_deposit = $${params.length}`);
+    }
+    if (minWithdrawal !== undefined) {
+      params.push(requireNonNegativeNumber(minWithdrawal, 'Minimum withdrawal'));
+      setClauses.push(`min_withdrawal = $${params.length}`);
+    }
     if (maintenanceHours !== undefined) {
       const hours = Math.round(Number(maintenanceHours));
-      if (!(hours >= 1 && hours <= 168)) throw new HttpError(400, 'Maintenance duration must be 1–168 hours');
+      const isInRange = hours >= MIN_MAINTENANCE_HOURS && hours <= MAX_MAINTENANCE_HOURS;
+      if (!isInRange) {
+        throw new HttpError(400, 'Maintenance duration must be 1–168 hours');
+      }
       params.push(hours);
-      sets.push(`maint_hours = $${params.length}`);
+      setClauses.push(`maint_hours = $${params.length}`);
     }
-    if (!sets.length) return res.json(present(await load()));
-    const { rows } = await query(`UPDATE settings SET ${sets.join(', ')} WHERE key = 'global' RETURNING *`, params);
-    res.json(present(rows[0]));
+
+    // Nothing to change: just return the current settings.
+    if (setClauses.length === 0) {
+      const settings = await loadGlobalSettings();
+      return res.json(toSettingsResponse(settings));
+    }
+
+    // Save and get the updated row back in the same statement (RETURNING *).
+    const { rows } = await query(`UPDATE settings SET ${setClauses.join(', ')} WHERE key = 'global' RETURNING *`, params);
+    res.json(toSettingsResponse(rows[0]));
   })
 );
 
-// POST /api/settings/maintenance  { enabled }
+// POST /api/settings/maintenance  body { enabled } → all settings after saving
+// Turning it on also records the start time (the user app uses it for the maintenance countdown).
 router.post(
   '/maintenance',
   asyncHandler(async (req, res) => {
     const enabled = Boolean(req.body.enabled);
+    const startedAt = enabled ? new Date() : null;
+
     const { rows } = await query(
       `UPDATE settings SET maint_enabled = $1, maint_started_at = $2 WHERE key = 'global' RETURNING *`,
-      [enabled, enabled ? new Date() : null]
+      [enabled, startedAt]
     );
-    res.json(present(rows[0]));
+    res.json(toSettingsResponse(rows[0]));
   })
 );
 
-// PUT /api/settings/telegram/:key  { value }
+// PUT /api/settings/telegram/:key  body { value } → all settings after saving
+// :key is one of official | support | community. An empty value clears the link.
 router.put(
   '/telegram/:key',
   asyncHandler(async (req, res) => {
-    const { key } = req.params;
-    if (!TELEGRAM_KEYS.includes(key)) throw new HttpError(404, 'Unknown channel');
-    const value = String(req.body.value ?? '').trim();
-    if (value && !/^https?:\/\//.test(value)) throw new HttpError(400, 'Enter a valid URL starting with https://');
-    const { rows } = await query(`UPDATE settings SET tg_${key} = $1 WHERE key = 'global' RETURNING *`, [value]);
-    res.json(present(rows[0]));
+    const channel = req.params.key;
+    if (!TELEGRAM_CHANNELS.includes(channel)) {
+      throw new HttpError(404, 'Unknown channel');
+    }
+
+    const link = String(req.body.value ?? '').trim();
+    const looksLikeUrl = /^https?:\/\//.test(link);
+    if (link && !looksLikeUrl) {
+      throw new HttpError(400, 'Enter a valid URL starting with https://');
+    }
+
+    // The column name (tg_official, tg_support, tg_community) is safe to put in the SQL text because
+    // `channel` was checked against TELEGRAM_CHANNELS above. The link itself goes in as $1.
+    const { rows } = await query(`UPDATE settings SET tg_${channel} = $1 WHERE key = 'global' RETURNING *`, [link]);
+    res.json(toSettingsResponse(rows[0]));
   })
 );
 
